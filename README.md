@@ -40,7 +40,8 @@ trésorerie (TFT) : c'est le TFT qui est produit.
 ## Installation
 
 ```bash
-pip install "compta-ohada @ git+https://github.com/beyreyconsulting/compta-ohada@v0.1.0"
+pip install "compta-ohada @ git+https://github.com/beyreyconsulting/compta-ohada@main"
+# en production, épinglez une version (…/compta-ohada@v0.1.0) une fois le tag créé
 # extras : [postgres] pour psycopg2, [migrations] pour Alembic
 ```
 
