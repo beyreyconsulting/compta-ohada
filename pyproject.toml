@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "compta-ohada"
+version = "0.1.0"
+description = "Cœur comptable SYSCOHADA révisé (partie double, append-only, hors-ligne d'abord) pour les ERP Beyrey Consulting."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "LicenseRef-Proprietary"
+license-files = ["LICENSE"]
+authors = [{ name = "Beyrey Consulting (Matec Pro SARL)" }]
+keywords = ["comptabilité", "SYSCOHADA", "OHADA", "UEMOA", "ERP", "partie double"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Natural Language :: French",
+    "Topic :: Office/Business :: Financial :: Accounting",
+]
+dependencies = [
+    "SQLAlchemy>=2.0.30,<2.1",
+]
+
+[project.optional-dependencies]
+postgres = ["psycopg2-binary>=2.9"]
+migrations = ["alembic>=1.13"]
+dev = [
+    "pytest>=8",
+    "hypothesis>=6.100",
+    "alembic>=1.13",
+    "psycopg2-binary>=2.9",
+    "build>=1.2",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+compta_ohada = ["migrations/*.py", "migrations/versions/*.py", "py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "postgres: test exécuté aussi contre PostgreSQL si COMPTA_TEST_PG_DSN est défini",
+]
