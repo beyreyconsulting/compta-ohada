@@ -33,8 +33,8 @@ import uuid
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import (Boolean, Date, DateTime, ForeignKey, Index, Integer,
-                        String, text)
+from sqlalchemy import (BigInteger, Boolean, Date, DateTime, ForeignKey, Index,
+                        Integer, String, text)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .socle import Base, Montant, SyncMixin, ZERO, unique_actif
@@ -95,6 +95,9 @@ class Compte(SyncMixin, Base):
     actif: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     # Vient du référentiel SYSCOHADA livré (et non d'une création du tenant).
     standard: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Compte tenu en devise (banque en euros, caisse en dollars…) : ses lignes
+    # portent le montant en devise et il est réévalué à la clôture.
+    devise: Mapped[str | None] = mapped_column(String(3))
 
     __table_args__ = (
         unique_actif("uq_compta_comptes_tenant_numero", "tenant_id", "numero"),
@@ -282,12 +285,19 @@ class LigneEcriture(SyncMixin, Base):
     # Ligne de taxe : code de la taxe et base hors taxe correspondante.
     taxe_code: Mapped[str | None] = mapped_column(String(20))
     base_taxe: Mapped[Decimal | None] = mapped_column(Montant)
+    # Opération en devise : code ISO et montant en devise, du même côté que
+    # la ligne (débit/crédit en monnaie de tenue sont la contre-valeur).
+    devise: Mapped[str | None] = mapped_column(String(3))
+    montant_devise: Mapped[Decimal | None] = mapped_column(Montant)
+    # Section analytique (classes 6, 7 et 8 uniquement).
+    section: Mapped[str | None] = mapped_column(String(30))
 
     ecriture: Mapped[Ecriture] = relationship(viewonly=True)
 
     __table_args__ = (
         Index("ix_compta_lignes_tenant_compte", "tenant_id", "compte_numero"),
         Index("ix_compta_lignes_tenant_tiers", "tenant_id", "tiers_ref"),
+        Index("ix_compta_lignes_tenant_section", "tenant_id", "section"),
     )
 
     @property
@@ -319,3 +329,98 @@ class LigneLettrage(SyncMixin, Base):
         String(36), ForeignKey("compta_lettrages.id"), nullable=False, index=True)
     ligne_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("compta_lignes.id"), nullable=False, index=True)
+
+
+# ---------------------------------------------------------------------------
+# Devises
+# ---------------------------------------------------------------------------
+
+class Cours(SyncMixin, Base):
+    """Cours d'une devise : valeur d'UNE unité en monnaie de tenue (XOF)."""
+
+    __tablename__ = "compta_cours"
+
+    tenant_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    devise: Mapped[str] = mapped_column(String(3), nullable=False)
+    date_cours: Mapped[date] = mapped_column(Date, nullable=False)
+    # Cours × 1 000 000 en entier : exact, portable (655,957 -> 655957000).
+    cours_micro: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        unique_actif("uq_compta_cours_tenant_devise_date", "tenant_id", "devise",
+                     "date_cours"),
+    )
+
+    @property
+    def cours(self) -> Decimal:
+        return Decimal(self.cours_micro) / Decimal(1_000_000)
+
+
+# ---------------------------------------------------------------------------
+# Immobilisations
+# ---------------------------------------------------------------------------
+
+class Immobilisation(SyncMixin, Base):
+    """Fiche d'immobilisation et paramètres de son plan d'amortissement.
+
+    Les dotations ne sont PAS stockées ici : elles sont dans le grand livre
+    (lignes du compte d'amortissement portant ``tiers_ref = code``). Le cumul
+    est toujours dérivé, jamais un compteur synchronisé."""
+
+    __tablename__ = "compta_immobilisations"
+
+    LINEAIRE = "LINEAIRE"
+    DEGRESSIF = "DEGRESSIF"
+    EN_SERVICE = "EN_SERVICE"
+    CEDEE = "CEDEE"
+    REBUTEE = "REBUTEE"
+
+    tenant_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    code: Mapped[str] = mapped_column(String(30), nullable=False)
+    libelle: Mapped[str] = mapped_column(String(200), nullable=False)
+    compte_immo: Mapped[str] = mapped_column(String(20), nullable=False)
+    compte_amort: Mapped[str | None] = mapped_column(String(20))
+    compte_dotation: Mapped[str | None] = mapped_column(String(20))
+    valeur_origine: Mapped[Decimal] = mapped_column(Montant, nullable=False)
+    valeur_residuelle: Mapped[Decimal] = mapped_column(Montant, nullable=False,
+                                                       default=ZERO)
+    # Amortissements pratiqués AVANT la reprise dans le logiciel (bilan
+    # d'ouverture d'un client existant) : déjà inclus dans le solde 28x.
+    amortissements_anterieurs: Mapped[Decimal] = mapped_column(
+        Montant, nullable=False, default=ZERO)
+    date_acquisition: Mapped[date] = mapped_column(Date, nullable=False)
+    date_mise_en_service: Mapped[date] = mapped_column(Date, nullable=False)
+    duree_mois: Mapped[int] = mapped_column(Integer, nullable=False)
+    methode: Mapped[str] = mapped_column(String(10), nullable=False, default=LINEAIRE)
+    # Coefficient dégressif × 100 (150 = 1,5).
+    coefficient_pc: Mapped[int | None] = mapped_column(Integer)
+    statut: Mapped[str] = mapped_column(String(12), nullable=False, default=EN_SERVICE)
+    date_sortie: Mapped[date | None] = mapped_column(Date)
+    prix_cession: Mapped[Decimal | None] = mapped_column(Montant)
+
+    __table_args__ = (
+        unique_actif("uq_compta_immobilisations_tenant_code", "tenant_id", "code"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Comptabilité analytique
+# ---------------------------------------------------------------------------
+
+class Section(SyncMixin, Base):
+    """Section analytique : activité, rayon, magasin, classe, service…
+
+    ``axe`` regroupe les sections d'une même logique (ex. « ACTIVITE »,
+    « MAGASIN ») ; une ligne porte une seule section."""
+
+    __tablename__ = "compta_sections"
+
+    tenant_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    code: Mapped[str] = mapped_column(String(30), nullable=False)
+    libelle: Mapped[str] = mapped_column(String(120), nullable=False)
+    axe: Mapped[str] = mapped_column(String(30), nullable=False, default="GENERAL")
+    actif: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    __table_args__ = (
+        unique_actif("uq_compta_sections_tenant_code", "tenant_id", "code"),
+    )

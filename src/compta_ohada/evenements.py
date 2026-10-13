@@ -41,7 +41,7 @@ from sqlalchemy.orm import Session
 
 from .erreurs import EcritureInvalide, ParametreInvalide
 from .modeles import Ecriture, LigneEcriture, LigneLettrage, Taxe
-from .noyau import Ligne, _date, _texte
+from .noyau import Ligne, _date, _texte, valider_code_devise
 from .socle import ZERO, montant
 from .taxes import ventiler
 
@@ -66,6 +66,8 @@ class LigneMontant:
     compte: str | None = None
     taxe: str | None = None
     libelle: str | None = None
+    # Section analytique (activité, rayon, classe, service…)
+    section: str | None = None
 
 
 @dataclass(frozen=True)
@@ -77,6 +79,9 @@ class Reglement:
     date: date | None = None
     reference: str | None = None
     source_id: str | None = None
+    # Document en devise : ``montant`` est en devise ; cours du jour du
+    # règlement (par défaut, le dernier cours saisi à cette date).
+    cours: Any = None
 
 
 @dataclass(frozen=True)
@@ -91,6 +96,10 @@ class Vente:
     prix_ttc: bool = True
     date_echeance: date | None = None
     reglements: list[Reglement] = field(default_factory=list)
+    # Facture en devise (EUR, USD…) : montants des lignes en devise, convertis
+    # au ``cours`` (par défaut, le cours connu à la date de la facture).
+    devise: str | None = None
+    cours: Any = None
 
 
 @dataclass(frozen=True)
@@ -105,6 +114,8 @@ class Achat:
     prix_ttc: bool = False
     date_echeance: date | None = None
     reglements: list[Reglement] = field(default_factory=list)
+    devise: str | None = None
+    cours: Any = None
 
 
 @dataclass(frozen=True)
@@ -139,6 +150,7 @@ class BulletinPaie:
     compte_brut: str | None = None
     reference: str | None = None
     libelle: str | None = None
+    section: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -175,20 +187,22 @@ class EvenementsMixin:
         if not lignes:
             raise EcritureInvalide("Document sans ligne.")
         brutes = []
+        sections = []
         for i, lg in enumerate(lignes, 1):
             m = montant(lg.montant, champ=f"ligne {i}")
             if m == ZERO:
                 continue
             compte = lg.compte or self._parametre(s, compte_defaut_param)
             brutes.append((str(compte), self._code_taxe(s, lg.taxe, type_taxe), m))
+            sections.append(lg.section or None)
         if not brutes:
             raise EcritureInvalide("Document de montant nul.")
         taxes = self._taxes_tenant(s, type_taxe)
         ventilees, taxes_v = ventiler(brutes, taxes, prix_ttc=prix_ttc)
         # Agrégation par (compte, taxe) : une ligne d'écriture par couple.
-        par_compte: dict[tuple[str, str | None], Decimal] = {}
-        for v in ventilees:
-            cle = (v.compte, v.taxe_code)
+        par_compte: dict[tuple[str, str | None, str | None], Decimal] = {}
+        for v, section in zip(ventilees, sections):
+            cle = (v.compte, v.taxe_code, section)
             par_compte[cle] = par_compte.get(cle, ZERO) + v.ht
         total_ttc = sum((v.ttc for v in ventilees), ZERO)
         if total_ttc <= ZERO:
@@ -231,6 +245,52 @@ class EvenementsMixin:
             return self._lettrer(s, [lg.id for lg in lignes])
         return None
 
+    def _devise_document(self, s: Session, devise, cours, jour: date
+                         ) -> tuple[str | None, Decimal | None]:
+        """(code devise, cours) d'un document ; (None, None) en monnaie de tenue."""
+        if not devise:
+            return None, None
+        code = valider_code_devise(devise)
+        if code == (self._parametre(s, "devise") or "XOF"):
+            return None, None
+        if cours is not None:
+            valeur = Decimal(str(cours))
+            if not valeur.is_finite() or valeur <= 0:
+                raise EcritureInvalide("Un cours de change est strictement positif.")
+            return code, valeur
+        return code, self._cours(s, code, jour)
+
+    def _exiger_devise_coherente(self, s: Session, compte: str, document_id,
+                                 source_type: str, devise: str | None) -> None:
+        """Un règlement rattaché à une facture en devise se saisit dans la
+        devise de la facture : sinon la créance resterait ouverte en devise et
+        la réévaluation de clôture constaterait un écart fictif."""
+        if not document_id:
+            return
+        devise_doc = s.scalar(
+            select(LigneEcriture.devise)
+            .join(Ecriture, Ecriture.id == LigneEcriture.ecriture_id)
+            .where(LigneEcriture.tenant_id == self.tenant_id,
+                   LigneEcriture.compte_numero == compte,
+                   LigneEcriture.deleted_at.is_(None),
+                   Ecriture.source_type == source_type,
+                   Ecriture.source_id == document_id,
+                   Ecriture.statut == Ecriture.VALIDEE).limit(1))
+        if devise_doc and devise_doc != devise:
+            raise EcritureInvalide(
+                f"Le document {document_id} est en {devise_doc} : saisissez le "
+                f"règlement en {devise_doc} (devise=\"{devise_doc}\", montant en "
+                f"{devise_doc}).")
+        if devise and not devise_doc:
+            existe = s.scalar(select(Ecriture.id).where(
+                Ecriture.tenant_id == self.tenant_id,
+                Ecriture.source_type == source_type,
+                Ecriture.source_id == document_id).limit(1))
+            if existe:
+                raise EcritureInvalide(
+                    f"Le document {document_id} est en monnaie de tenue : "
+                    "règlement en devise refusé.")
+
     @staticmethod
     def _source_reglement(document_id: str, i: int, reglement: Reglement) -> str:
         return reglement.source_id or f"{document_id}#{i}"
@@ -257,11 +317,13 @@ class EvenementsMixin:
             lignes = [Ligne(compte=compte_client, debit=total, libelle=libelle,
                             tiers_ref=tiers_ref, tiers_nom=tiers_nom,
                             date_echeance=vente.date_echeance)]
-            for (compte, code), ht in sorted(par_compte.items(),
-                                             key=lambda x: (x[0][0], x[0][1] or "")):
+            for (compte, code, section), ht in sorted(
+                    par_compte.items(),
+                    key=lambda x: (x[0][0], x[0][1] or "", x[0][2] or "")):
                 if ht == ZERO:
                     continue
                 lignes.append(Ligne(compte=compte, libelle=libelle, taxe_code=code,
+                                    section=section,
                                     **self._sens(ht, au_credit=True)))
             for tv in taxes_v:
                 if tv.tva == ZERO:
@@ -269,6 +331,9 @@ class EvenementsMixin:
                 lignes.append(Ligne(compte=tv.compte, credit=tv.tva,
                                     libelle=f"TVA {tv.taux} % — {libelle}",
                                     taxe_code=tv.code, base_taxe=tv.base))
+            devise, cours = self._devise_document(s, vente.devise, vente.cours, jour)
+            if devise:
+                lignes = self._convertir_document(lignes, 0, devise, cours)
             facture = self._saisir(
                 self._parametre(s, "journal_ventes"), jour, libelle, lignes,
                 reference=vente.reference, valider=True, source_type="vente",
@@ -277,7 +342,8 @@ class EvenementsMixin:
                 s, vente.reglements, document_id=source_id, jour=jour,
                 compte_tiers=compte_client, tiers_ref=tiers_ref,
                 tiers_nom=tiers_nom, encaissement=True, source_type="vente.reglement",
-                libelle=libelle, reference=vente.reference, plafond=facture["total"])
+                libelle=libelle, reference=vente.reference,
+                plafond=total if devise else facture["total"], devise=devise)
             code = self._lettrer_document(s, compte_client, tiers_ref, source_id,
                                           ("vente", "vente.reglement"))
             return {"facture": facture, "reglements": reglements, "lettrage": code}
@@ -288,7 +354,8 @@ class EvenementsMixin:
                     document_id: str, jour: date, compte_tiers: str,
                     tiers_ref: str | None, tiers_nom: str | None,
                     encaissement: bool, source_type: str, libelle: str,
-                    reference: str | None, plafond: Decimal | None) -> list[dict]:
+                    reference: str | None, plafond: Decimal | None,
+                    devise: str | None = None) -> list[dict]:
         resultats = []
         cumul = ZERO
         for i, r in enumerate(reglements, 1):
@@ -300,6 +367,21 @@ class EvenementsMixin:
                 raise EcritureInvalide(
                     f"Règlements ({cumul}) supérieurs au montant du document "
                     f"({plafond}). La monnaie rendue ne se comptabilise pas.")
+            if devise:
+                date_r = _date(r.date) if r.date else jour
+                _, cours_r = self._devise_document(s, devise, r.cours, date_r)
+                resultats.append(self._reglement_devise(
+                    s, m_devise=m, devise=devise, cours=cours_r,
+                    compte_tresorerie=r.compte, jour=date_r,
+                    compte_tiers=compte_tiers, tiers_ref=tiers_ref,
+                    tiers_nom=tiers_nom, encaissement=encaissement,
+                    source_type=source_type,
+                    source_id=self._source_reglement(document_id, i, r),
+                    document_lie=document_id,
+                    types=(source_type.split(".")[0], source_type),
+                    libelle=f"Règlement {libelle}",
+                    reference=r.reference or reference))
+                continue
             resultats.append(self._reglement(
                 s, montant_=m, compte_tresorerie=r.compte,
                 jour=_date(r.date) if r.date else jour, compte_tiers=compte_tiers,
@@ -328,13 +410,40 @@ class EvenementsMixin:
                             document_lie=document_lie,
                             type_ecriture=Ecriture.NORMALE, session=s)
 
+    def _reglement_devise(self, s: Session, *, m_devise: Decimal, devise: str,
+                          cours: Decimal, compte_tresorerie: str, jour: date,
+                          compte_tiers: str, tiers_ref, tiers_nom,
+                          encaissement: bool, source_type: str, source_id: str,
+                          document_lie: str | None, types: tuple[str, ...],
+                          libelle: str, reference: str | None) -> dict:
+        """Règlement en devise : la créance/dette sort à son cours historique,
+        la trésorerie entre au cours du jour, la différence est un écart de
+        change réalisé (656 / 756)."""
+        existante = self._ecriture_source(s, source_type, source_id)
+        if existante is not None:
+            from .noyau import resume_ecriture
+            return resume_ecriture(existante, existante.lignes)
+        lignes = self._lignes_reglement_devise(
+            s, m_devise=m_devise, devise=devise, cours=cours,
+            compte_tresorerie=compte_tresorerie, compte_tiers=compte_tiers,
+            tiers_ref=tiers_ref, tiers_nom=tiers_nom, encaissement=encaissement,
+            document_id=document_lie, types=types, libelle=libelle)
+        return self._saisir(self._journal_de(s, compte_tresorerie), jour, libelle,
+                            lignes, reference=reference, valider=True,
+                            source_type=source_type, source_id=source_id,
+                            document_lie=document_lie,
+                            type_ecriture=Ecriture.NORMALE, session=s)
+
     def comptabiliser_reglement_client(
             self, source_id: str, date_reglement, montant_, *, vente_source_id:
             str | None = None, tiers_ref: str | None = None,
             tiers_nom: str | None = None, compte: str = "5711",
-            reference: str | None = None,
-            session: Session | None = None) -> dict:
+            reference: str | None = None, devise: str | None = None,
+            cours=None, session: Session | None = None) -> dict:
         """Encaissement d'une créance client (vente à crédit, partielle).
+
+        En devise (``devise="EUR"``), ``montant_`` est en devise et l'écart
+        avec le cours de la facture est comptabilisé en 656 / 756.
 
         Avec ``vente_source_id``, le règlement est rattaché à la vente et le
         lettrage se fait dès que la vente est soldée."""
@@ -347,14 +456,22 @@ class EvenementsMixin:
 
         def _t(s: Session) -> dict:
             compte_client = self._parametre(s, "compte_client")
-            ecr = self._reglement(
-                s, montant_=m, compte_tresorerie=compte, jour=jour,
-                compte_tiers=compte_client, tiers_ref=tiers_ref,
-                tiers_nom=tiers_nom, encaissement=True,
-                source_type="vente.reglement", source_id=source_id,
-                document_lie=vente_source_id,
-                libelle=f"Règlement client {reference or tiers_nom or tiers_ref}",
-                reference=reference)
+            code_devise, cours_r = self._devise_document(s, devise, cours, jour)
+            self._exiger_devise_coherente(s, compte_client, vente_source_id,
+                                          "vente", code_devise)
+            commun = dict(compte_tresorerie=compte, jour=jour,
+                          compte_tiers=compte_client, tiers_ref=tiers_ref,
+                          tiers_nom=tiers_nom, encaissement=True,
+                          source_type="vente.reglement", source_id=source_id,
+                          document_lie=vente_source_id,
+                          libelle=f"Règlement client {reference or tiers_nom or tiers_ref}",
+                          reference=reference)
+            if code_devise:
+                ecr = self._reglement_devise(
+                    s, m_devise=m, devise=code_devise, cours=cours_r,
+                    types=("vente", "vente.reglement"), **commun)
+            else:
+                ecr = self._reglement(s, montant_=m, **commun)
             code = None
             if vente_source_id:
                 code = self._lettrer_document(s, compte_client, tiers_ref,
@@ -385,11 +502,13 @@ class EvenementsMixin:
             libelle = achat.libelle or (
                 f"Achat {achat.reference}" if achat.reference else "Achat")
             lignes = []
-            for (compte, code), ht in sorted(par_compte.items(),
-                                             key=lambda x: (x[0][0], x[0][1] or "")):
+            for (compte, code, section), ht in sorted(
+                    par_compte.items(),
+                    key=lambda x: (x[0][0], x[0][1] or "", x[0][2] or "")):
                 if ht == ZERO:
                     continue
                 lignes.append(Ligne(compte=compte, libelle=libelle, taxe_code=code,
+                                    section=section,
                                     **self._sens(ht, au_credit=False)))
             for tv in taxes_v:
                 if tv.tva == ZERO:
@@ -401,6 +520,10 @@ class EvenementsMixin:
                                 libelle=libelle, tiers_ref=tiers_ref,
                                 tiers_nom=tiers_nom,
                                 date_echeance=achat.date_echeance))
+            devise, cours = self._devise_document(s, achat.devise, achat.cours, jour)
+            if devise:
+                lignes = self._convertir_document(lignes, len(lignes) - 1, devise,
+                                                  cours)
             facture = self._saisir(
                 self._parametre(s, "journal_achats"), jour, libelle, lignes,
                 reference=achat.reference, valider=True, source_type="achat",
@@ -410,7 +533,8 @@ class EvenementsMixin:
                 compte_tiers=compte_fournisseur, tiers_ref=tiers_ref,
                 tiers_nom=tiers_nom, encaissement=False,
                 source_type="achat.reglement", libelle=libelle,
-                reference=achat.reference, plafond=facture["total"])
+                reference=achat.reference,
+                plafond=total if devise else facture["total"], devise=devise)
             code = self._lettrer_document(s, compte_fournisseur, tiers_ref,
                                           source_id, ("achat", "achat.reglement"))
             return {"facture": facture, "reglements": reglements, "lettrage": code}
@@ -421,8 +545,8 @@ class EvenementsMixin:
             self, source_id: str, date_reglement, montant_, *,
             achat_source_id: str | None = None, tiers_ref: str | None = None,
             tiers_nom: str | None = None, compte: str = "5711",
-            reference: str | None = None,
-            session: Session | None = None) -> dict:
+            reference: str | None = None, devise: str | None = None,
+            cours=None, session: Session | None = None) -> dict:
         source_id = _texte(source_id, champ="identifiant du règlement", max_len=64)
         jour = _date(date_reglement)
         m = montant(montant_, champ="règlement")
@@ -432,14 +556,22 @@ class EvenementsMixin:
 
         def _t(s: Session) -> dict:
             compte_fournisseur = self._parametre(s, "compte_fournisseur")
-            ecr = self._reglement(
-                s, montant_=m, compte_tresorerie=compte, jour=jour,
-                compte_tiers=compte_fournisseur, tiers_ref=tiers_ref,
-                tiers_nom=tiers_nom, encaissement=False,
-                source_type="achat.reglement", source_id=source_id,
-                document_lie=achat_source_id,
-                libelle=f"Règlement fournisseur {reference or tiers_nom or tiers_ref}",
-                reference=reference)
+            code_devise, cours_r = self._devise_document(s, devise, cours, jour)
+            self._exiger_devise_coherente(s, compte_fournisseur, achat_source_id,
+                                          "achat", code_devise)
+            commun = dict(compte_tresorerie=compte, jour=jour,
+                          compte_tiers=compte_fournisseur, tiers_ref=tiers_ref,
+                          tiers_nom=tiers_nom, encaissement=False,
+                          source_type="achat.reglement", source_id=source_id,
+                          document_lie=achat_source_id,
+                          libelle=f"Règlement fournisseur {reference or tiers_nom or tiers_ref}",
+                          reference=reference)
+            if code_devise:
+                ecr = self._reglement_devise(
+                    s, m_devise=m, devise=code_devise, cours=cours_r,
+                    types=("achat", "achat.reglement"), **commun)
+            else:
+                ecr = self._reglement(s, montant_=m, **commun)
             code = None
             if achat_source_id:
                 code = self._lettrer_document(s, compte_fournisseur, tiers_ref,
@@ -459,6 +591,7 @@ class EvenementsMixin:
                               tiers_ref: str | None = None,
                               tiers_nom: str | None = None,
                               reference: str | None = None,
+                              section: str | None = None,
                               session: Session | None = None) -> dict:
         """Dépense payée comptant (loyer, électricité, transport…).
 
@@ -471,12 +604,13 @@ class EvenementsMixin:
 
         def _t(s: Session) -> dict:
             par_compte, taxes_v, total = self._lignes_document(
-                s, [LigneMontant(montant_, compte=compte_charge, taxe=taxe)],
+                s, [LigneMontant(montant_, compte=compte_charge, taxe=taxe,
+                                 section=section)],
                 Taxe.ACHAT, "compte_achat_marchandises", prix_ttc)
             lignes = [Ligne(compte=c, libelle=libelle, taxe_code=code,
-                            tiers_ref=tiers_ref, tiers_nom=tiers_nom,
+                            tiers_ref=tiers_ref, tiers_nom=tiers_nom, section=sec,
                             **self._sens(ht, au_credit=False))
-                      for (c, code), ht in par_compte.items() if ht != ZERO]
+                      for (c, code, sec), ht in par_compte.items() if ht != ZERO]
             lignes += [Ligne(compte=tv.compte, debit=tv.tva,
                              libelle=f"TVA {tv.taux} % — {libelle}",
                              taxe_code=tv.code, base_taxe=tv.base)
@@ -495,6 +629,7 @@ class EvenementsMixin:
                               compte_tresorerie: str = "5711",
                               taxe: str | None = "", prix_ttc: bool = True,
                               reference: str | None = None,
+                              section: str | None = None,
                               session: Session | None = None) -> dict:
         """Recette encaissée hors vente (location, commission, subvention…)."""
         source_id = _texte(source_id, champ="identifiant de recette", max_len=64)
@@ -503,12 +638,13 @@ class EvenementsMixin:
 
         def _t(s: Session) -> dict:
             par_compte, taxes_v, total = self._lignes_document(
-                s, [LigneMontant(montant_, compte=compte_produit, taxe=taxe)],
+                s, [LigneMontant(montant_, compte=compte_produit, taxe=taxe,
+                                 section=section)],
                 Taxe.VENTE, "compte_vente_services", prix_ttc)
             lignes = [Ligne(compte=compte_tresorerie, debit=total, libelle=libelle)]
-            lignes += [Ligne(compte=c, libelle=libelle, taxe_code=code,
+            lignes += [Ligne(compte=c, libelle=libelle, taxe_code=code, section=sec,
                              **self._sens(ht, au_credit=True))
-                       for (c, code), ht in par_compte.items() if ht != ZERO]
+                       for (c, code, sec), ht in par_compte.items() if ht != ZERO]
             lignes += [Ligne(compte=tv.compte, credit=tv.tva,
                              libelle=f"TVA {tv.taux} % — {libelle}",
                              taxe_code=tv.code, base_taxe=tv.base)
@@ -657,7 +793,8 @@ class EvenementsMixin:
             lib = bulletin.libelle or f"Paie {bulletin.salarie_nom}"
             ref, nom = bulletin.salarie_ref, bulletin.salarie_nom
             lignes = [Ligne(compte=bulletin.compte_brut or self._parametre(
-                s, "compte_salaires"), debit=brut, libelle=f"Salaire brut — {nom}")]
+                s, "compte_salaires"), debit=brut, libelle=f"Salaire brut — {nom}",
+                section=bulletin.section)]
             for r, m in retenues:
                 if m:
                     lignes.append(Ligne(compte=r.compte, credit=m,
@@ -676,7 +813,8 @@ class EvenementsMixin:
                     continue
                 lignes.append(Ligne(compte=c.compte_charge or self._parametre(
                     s, "compte_charges_sociales"), debit=m,
-                    libelle=f"{c.libelle} (part patronale) — {nom}"))
+                    libelle=f"{c.libelle} (part patronale) — {nom}",
+                    section=bulletin.section))
                 lignes.append(Ligne(compte=c.compte_organisme, credit=m,
                                     libelle=f"{c.libelle} (part patronale) — {nom}"))
             ecr = self._saisir(self._parametre(s, "journal_paie"), jour, lib, lignes,

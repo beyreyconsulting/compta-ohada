@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "compta-ohada"
-version = "0.1.0"
+version = "0.2.0"
 description = "Cœur comptable SYSCOHADA révisé (partie double, append-only, hors-ligne d'abord) pour les ERP Beyrey Consulting."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -24,12 +24,16 @@ dependencies = [
 [project.optional-dependencies]
 postgres = ["psycopg2-binary>=2.9"]
 migrations = ["alembic>=1.13"]
+exports = ["openpyxl>=3.1", "reportlab>=4.0"]
 dev = [
     "pytest>=8",
     "hypothesis>=6.100",
     "alembic>=1.13",
     "psycopg2-binary>=2.9",
     "build>=1.2",
+    "openpyxl>=3.1",
+    "reportlab>=4.0",
+    "pypdf>=4",
 ]
 
 [tool.setuptools.packages.find]

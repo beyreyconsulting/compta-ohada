@@ -273,3 +273,36 @@ def test_parametres_journal_et_taxe_verifies(compta):
         compta.definir_parametre("taxe_vente_defaut", "TVA99")
     with pytest.raises(CompteNonImputable):
         compta.definir_parametre("compte_client", "41")
+
+
+def test_empreintes_compatibles_avec_la_version_0_1(compta):
+    """Les écritures validées en 0.1.0 (sans devise ni section) gardent la
+    même empreinte : la mise à jour ne casse aucune chaîne existante."""
+    import hashlib
+    import json
+    from compta_ohada.integrite import _centimes, calculer_empreinte
+
+    def empreinte_0_1(e, lignes, exercice, precedente):
+        donnees = {
+            "tenant": e.tenant_id, "journal": e.journal_code, "exercice": exercice,
+            "poste": e.poste, "sequence": e.sequence, "numero": e.numero,
+            "date": e.date_ecriture.isoformat(), "libelle": e.libelle,
+            "reference": e.reference or "", "type": e.type_ecriture,
+            "source": [e.source_type or "", e.source_id or ""],
+            "contrepasse": e.contrepasse_id or "",
+            "document_lie": e.document_lie or "",
+            "lignes": [[lg.ordre, lg.compte_numero, _centimes(lg.debit),
+                        _centimes(lg.credit), lg.tiers_ref or "", lg.libelle,
+                        lg.taxe_code or "", _centimes(lg.base_taxe),
+                        lg.date_echeance.isoformat() if lg.date_echeance else ""]
+                       for lg in sorted(lignes, key=lambda x: (x.ordre, x.id))],
+            "precedente": precedente}
+        return hashlib.sha256(json.dumps(donnees, ensure_ascii=False, sort_keys=True,
+                                         separators=(",", ":")).encode()).hexdigest()
+
+    r = apport(compta, "1234.56", reference="PJ-9")
+    with Session(compta.engine) as s:
+        e = s.get(Ecriture, r["id"])
+        lignes = list(e.lignes)
+        assert calculer_empreinte(e, lignes, "2026", e.empreinte_precedente) == \
+            empreinte_0_1(e, lignes, "2026", e.empreinte_precedente) == e.empreinte

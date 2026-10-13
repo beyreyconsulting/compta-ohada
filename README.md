@@ -33,6 +33,11 @@ montants exacts au centime et inaltérabilité vérifiable.
 | **États financiers** | Bilan (brut / amortissements / net), compte de résultat (soldes XA → XI), **tableau des flux de trésorerie**, avec colonne N-1 |
 | **Clôture** | Détermination du résultat (131/139), à-nouveaux **par tiers**, ouverture de N+1, verrouillage, affectation du résultat |
 | **Contrôles** | Verrouillage de période, exercice clos, `controles()` après synchronisation (doubles contre-passations, doublons de génération…) |
+| **Devises** *(0.2)* | Factures et règlements en EUR, USD…, parité EUR/XOF installée d'office, écarts de change réalisés (656/756), réévaluation de clôture (478/479, provision 194), comptes de trésorerie tenus en devise (676/776), extourne à l'ouverture |
+| **Immobilisations** *(0.2)* | Fiches, plans linéaire (prorata 30/360) et dégressif, dotations automatiques idempotentes (mensuelles ou annuelles), cession, mise au rebut, reprise d'un parc existant, tableau des immobilisations et amortissements |
+| **SMT** *(0.2)* | Système minimal de trésorerie : seuils de l'art. 13 AUDCIF, bilan et compte de résultat SMT, livre des recettes et dépenses |
+| **Analytique** *(0.2)* | Sections par axe (rayon, magasin, classe, service), résultat analytique qui retombe toujours sur le résultat comptable |
+| **Exports** *(0.2)* | Tous les états en Excel (montants numériques) et en PDF (en-tête de l'entreprise, pagination) |
 
 Le SYSCOHADA révisé a **remplacé le TAFIRE** par le tableau des flux de
 trésorerie (TFT) : c'est le TFT qui est produit.
@@ -188,14 +193,59 @@ concurrence, la conformité de la migration Alembic, et des tests de propriété
 (Hypothesis) qui vérifient sur des séquences aléatoires que la balance, le
 bilan et le TFT restent équilibrés.
 
-## Limites connues (v0.1)
+## Devises, immobilisations, SMT, analytique, exports (0.2)
 
-- Système normal uniquement (pas encore de système minimal de trésorerie).
-- Pas de multi-devises (une devise par tenant).
-- Pas encore d'immobilisations avec plan d'amortissement automatique ni de
-  comptabilité analytique (classe 9 disponible en saisie).
-- Pas d'export des états en PDF/Excel : l'ERP met en forme les dictionnaires.
-- Les notes annexes de la liasse ne sont pas produites.
+```python
+# Devises : la parité EUR (655,957) est installée ; les autres cours se saisissent.
+compta.definir_cours("USD", "2026-03-01", "600")
+compta.comptabiliser_vente(Vente("V9", date(2026, 3, 2), [LigneMontant("1000", taxe="")],
+                                 tiers_ref="C-US", devise="USD"))
+compta.comptabiliser_reglement_client("R9", "2026-04-02", "1000", vente_source_id="V9",
+                                      tiers_ref="C-US", compte="5211", devise="USD")
+compta.reevaluer_devises("2026-12-31")       # automatique à la clôture sinon
+
+# Immobilisations
+compta.creer_immobilisation("INFO-001", "Ordinateur", "2442", valeur_origine="900000",
+                            date_acquisition="2026-06-01", duree_mois=36,
+                            contrepartie="481", tiers_ref="F2")
+compta.comptabiliser_dotations("2026-12-31")
+compta.ceder_immobilisation("INFO-001", "2027-09-30", prix="300000", compte_tresorerie="5711")
+
+# Très petites entités
+compta.etats_smt("2026", activite="negoce")
+compta.livre_recettes_depenses("2026-01-01", "2026-12-31")
+
+# Analytique
+compta.creer_section("QUINC", "Quincaillerie", axe="RAYON")
+compta.resultat_analytique("2026-01-01", "2026-12-31", axe="RAYON")
+
+# Exports (pip install compta-ohada[exports])
+compta.definir_parametre("raison_sociale", "Quincaillerie Alpha SARL")
+compta.exporter_etat("bilan", "bilan_2026.pdf", exercice="2026")
+compta.exporter_etat("balance", "balance_2026.xlsx", debut="2026-01-01", fin="2026-12-31")
+```
+
+**Mise à jour depuis 0.1.0** : `alembic upgrade heads` (migration `compta_0002`,
+colonnes nouvelles nullables), puis `initialiser()` sur chaque tenant
+(idempotent) pour installer la parité EUR et les nouveaux paramètres. Les
+empreintes des écritures 0.1.0 restent valides.
+
+## Points à faire valider par l'expert-comptable
+
+- Plan comptable et tables de passage (bilan, compte de résultat, TFT, SMT).
+- Taux de TVA (18 % par défaut) et barème des coefficients dégressifs (1,5 /
+  2 / 2,5 selon la durée) — propres à chaque Code général des impôts.
+- Convention de prorata linéaire (jours, base 360).
+- Traitement des écarts de conversion (478/479, provision 194, extourne).
+
+## Limites connues (v0.2)
+
+- Les notes annexes de la liasse ne sont pas produites (le tableau des
+  immobilisations en fournit une partie).
+- Pas de répartition analytique automatique (clés de répartition) : une ligne
+  porte une seule section.
+- Règlement partiel en devise d'un tiers ayant plusieurs factures ouvertes :
+  le cours historique utilisé est le cours moyen pondéré de ses factures.
 
 ## Licence
 

@@ -92,6 +92,16 @@ PARAMETRES_PAR_DEFAUT: dict[str, str] = {
     "journal_od": "OD",
     "journal_paie": "PA",
     "journal_a_nouveaux": "AN",
+    # Devises (voir devises.py)
+    "compte_perte_change": "656",
+    "compte_gain_change": "756",
+    "compte_perte_change_financiere": "676",
+    "compte_gain_change_financiere": "776",
+    "compte_ecart_conversion_actif": "478",
+    "compte_ecart_conversion_passif": "479",
+    "compte_provision_change": "194",
+    "compte_dotation_provision_financiere": "697",
+    "compte_reprise_provision_financiere": "797",
 }
 
 LONGUEUR_MAX_LIBELLE = 255
@@ -134,6 +144,13 @@ def _date(valeur, *, champ: str = "date") -> date:
     raise EcritureInvalide(f"{champ} invalide : {valeur!r} (attendu AAAA-MM-JJ).")
 
 
+def valider_code_devise(code) -> str:
+    code = str(code or "").strip().upper()
+    if len(code) != 3 or not code.isalpha() or not code.isascii():
+        raise EcritureInvalide(f"Code devise invalide : {code!r} (ISO 4217, ex. EUR).")
+    return code
+
+
 def _numero_compte(numero) -> str:
     numero = str(numero or "").strip()
     if not numero.isdigit() or len(numero) > 20 or numero[0] == "0":
@@ -158,6 +175,9 @@ class Ligne:
     date_echeance: date | None = None
     taxe_code: str | None = None
     base_taxe: Any = None
+    devise: str | None = None
+    montant_devise: Any = None
+    section: str | None = None
 
     @classmethod
     def depuis(cls, valeur) -> "Ligne":
@@ -194,7 +214,8 @@ def resume_ecriture(e: Ecriture, lignes: Iterable[LigneEcriture]) -> dict:
             "libelle": lg.libelle, "debit": lg.debit, "credit": lg.credit,
             "tiers_ref": lg.tiers_ref, "tiers_nom": lg.tiers_nom,
             "date_echeance": lg.date_echeance, "taxe_code": lg.taxe_code,
-            "base_taxe": lg.base_taxe,
+            "base_taxe": lg.base_taxe, "devise": lg.devise,
+            "montant_devise": lg.montant_devise, "section": lg.section,
         } for lg in sorted(lignes, key=lambda x: x.ordre)],
     }
 
@@ -350,6 +371,15 @@ class Noyau:
                     tenant_id=self.tenant_id, cle=cle, valeur=valeur))
                 crees["parametres"] += 1
             s.flush()
+            # Parité fixe du franc CFA avec l'euro (1 EUR = 655,957 XOF/XAF).
+            if devise in ("XOF", "XAF"):
+                from .modeles import Cours
+                cid = id_deterministe(self.tenant_id, "cours", "EUR|1999-01-01")
+                if s.get(Cours, cid, execution_options=INCLURE_SUPPRIMES) is None:
+                    s.add(Cours(id=cid, tenant_id=self.tenant_id, devise="EUR",
+                                date_cours=date(1999, 1, 1),
+                                cours_micro=655_957_000))
+                    crees["cours"] = 1
             if exercice is not None:
                 code = str(exercice)
                 if self._exercice_par_code(s, code) is None:
@@ -427,7 +457,7 @@ class Noyau:
         return compte
 
     def creer_compte(self, numero: str, libelle: str, *,
-                     lettrable: bool | None = None,
+                     lettrable: bool | None = None, devise: str | None = None,
                      session: Session | None = None) -> dict:
         """Ajoute un compte au plan du tenant (ex. 5521 « Orange Money »).
 
@@ -439,8 +469,11 @@ class Noyau:
                 "Les classes et rubriques sont fixées par le SYSCOHADA : "
                 "créez un compte d'au moins 3 chiffres.")
         libelle = _texte(libelle, champ="libellé", max_len=200)
+        devise = valider_code_devise(devise) if devise else None
 
         def _t(s: Session) -> dict:
+            if devise and devise == (self._parametre(s, "devise") or "XOF"):
+                raise CompteInconnu(f"{devise} est la monnaie de tenue.")
             rubrique = s.scalar(select(Compte).where(
                 Compte.tenant_id == self.tenant_id, Compte.numero == numero[:2]))
             if rubrique is None:
@@ -466,6 +499,7 @@ class Noyau:
             compte.is_synced = False
             compte.lettrable = (est_lettrable_par_defaut(numero)
                                 if lettrable is None else bool(lettrable))
+            compte.devise = devise
             s.flush()
             return self._compte_dict(compte)
 
@@ -509,7 +543,7 @@ class Noyau:
     def _compte_dict(c: Compte) -> dict:
         return {"numero": c.numero, "libelle": c.libelle, "classe": c.classe,
                 "imputable": c.imputable, "lettrable": c.lettrable,
-                "actif": c.actif, "standard": c.standard}
+                "actif": c.actif, "standard": c.standard, "devise": c.devise}
 
     def comptes(self, *, classe: int | None = None, prefixe: str | None = None,
                 inclure_inactifs: bool = False,
@@ -794,6 +828,9 @@ class Noyau:
             if not d and not c:
                 raise EcritureInvalide(f"Ligne {i} : montant nul.")
             compte = self._compte(s, lg.compte, pour_imputation=True)
+            self._controler_devise_ligne(s, i, lg, compte)
+            if lg.section:
+                self._controler_section(s, i, lg.section, compte)
             if lg.taxe_code:
                 self._taxe(s, lg.taxe_code)
             if lg.base_taxe is not None:
@@ -815,6 +852,42 @@ class Noyau:
                 "s'équilibrer entre eux, sans contrepartie au bilan.")
         return preparees, total_d
 
+    def _controler_devise_ligne(self, s: Session, i: int, lg: "Ligne",
+                                compte: Compte) -> None:
+        if lg.devise is None:
+            if lg.montant_devise is not None:
+                raise EcritureInvalide(f"Ligne {i} : montant en devise sans devise.")
+            if compte.devise:
+                raise EcritureInvalide(
+                    f"Ligne {i} : le compte {compte.numero} est tenu en "
+                    f"{compte.devise}, précisez le montant en devise.")
+            return
+        code = valider_code_devise(lg.devise)
+        if code == (self._parametre(s, "devise") or "XOF"):
+            raise EcritureInvalide(
+                f"Ligne {i} : {code} est la monnaie de tenue, pas une devise.")
+        if compte.devise and compte.devise != code:
+            raise EcritureInvalide(
+                f"Ligne {i} : le compte {compte.numero} est tenu en "
+                f"{compte.devise}, pas en {code}.")
+        if lg.montant_devise is None or montant(
+                lg.montant_devise, champ=f"ligne {i} montant devise") < 0:
+            raise EcritureInvalide(
+                f"Ligne {i} : montant en devise manquant ou négatif.")
+
+    def _controler_section(self, s: Session, i: int, code, compte: Compte) -> None:
+        from .modeles import Section
+        if compte.classe not in (6, 7, 8):
+            raise EcritureInvalide(
+                f"Ligne {i} : une section analytique ne se porte que sur un "
+                "compte de charges ou de produits (classes 6, 7, 8).")
+        code = str(code).strip().upper()
+        section = s.scalar(select(Section).where(
+            Section.tenant_id == self.tenant_id, Section.code == code))
+        if section is None or not section.actif:
+            raise EcritureInvalide(
+                f"Ligne {i} : section analytique {code!r} inconnue ou désactivée.")
+
     def _ajouter_lignes(self, s: Session, ecriture: Ecriture, preparees,
                         libelle_defaut: str) -> list[LigneEcriture]:
         crees = []
@@ -835,7 +908,10 @@ class Noyau:
                 taxe_code=(str(lg.taxe_code).strip().upper()
                            if lg.taxe_code else None),
                 base_taxe=(montant(lg.base_taxe) if lg.base_taxe is not None
-                           else None))
+                           else None),
+                devise=valider_code_devise(lg.devise) if lg.devise else None,
+                montant_devise=(montant(lg.montant_devise) if lg.devise else None),
+                section=str(lg.section).strip().upper() if lg.section else None)
             s.add(ligne)
             crees.append(ligne)
         return crees
@@ -877,6 +953,7 @@ class Noyau:
     def _saisir(self, journal, date_ecriture, libelle, lignes, *, reference,
                 valider, source_type, source_id, type_ecriture,
                 document_lie: str | None = None,
+                ignorer_verrou: bool = False,
                 contrepasse_id: str | None = None,
                 session: Session | None = None) -> dict:
         jour = _date(date_ecriture)
@@ -905,8 +982,8 @@ class Noyau:
                     "d'exercice.")
             if type_ecriture == Ecriture.A_NOUVEAU and j.type_journal != Journal.A_NOUVEAU:
                 raise EcritureInvalide("Les à-nouveaux vont au journal AN.")
-            ex = self._controler_date(
-                s, jour, ignorer_verrou=type_ecriture in TYPES_HORS_VERROU)
+            hors_verrou = ignorer_verrou or type_ecriture in TYPES_HORS_VERROU
+            ex = self._controler_date(s, jour, ignorer_verrou=hors_verrou)
             preparees, total = self._preparer_lignes(s, lignes, libelle)
             e = Ecriture(tenant_id=self.tenant_id, journal_id=j.id,
                          journal_code=j.code, exercice_id=ex.id,
@@ -922,17 +999,18 @@ class Noyau:
             crees = self._ajouter_lignes(s, e, preparees, libelle)
             s.flush()
             if valider:
-                self._valider(s, e, crees)
+                self._valider(s, e, crees, ignorer_verrou=hors_verrou)
             return resume_ecriture(e, crees)
 
         return self._executer(_t, session)
 
-    def _valider(self, s: Session, e: Ecriture, lignes: list[LigneEcriture]) -> None:
+    def _valider(self, s: Session, e: Ecriture, lignes: list[LigneEcriture], *,
+                 ignorer_verrou: bool = False) -> None:
         if e.statut == Ecriture.VALIDEE:
             return
         ex = self._controler_date(
             s, e.date_ecriture,
-            ignorer_verrou=e.type_ecriture in TYPES_HORS_VERROU)
+            ignorer_verrou=ignorer_verrou or e.type_ecriture in TYPES_HORS_VERROU)
         if ex.id != e.exercice_id:
             e.exercice_id = ex.id
         total_d = sum((lg.debit for lg in lignes), ZERO)
@@ -1110,7 +1188,9 @@ class Noyau:
                               credit=lg.debit, libelle=lg.libelle,
                               tiers_ref=lg.tiers_ref, tiers_nom=lg.tiers_nom,
                               date_echeance=lg.date_echeance,
-                              taxe_code=lg.taxe_code, base_taxe=lg.base_taxe)
+                              taxe_code=lg.taxe_code, base_taxe=lg.base_taxe,
+                              devise=lg.devise, montant_devise=lg.montant_devise,
+                              section=lg.section)
                         for lg in originales]
             j = self._journal(s, e.journal_code)
             ex = self._controler_date(s, jour)

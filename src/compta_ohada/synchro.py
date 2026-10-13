@@ -18,8 +18,9 @@ from __future__ import annotations
 from decimal import Decimal
 
 from .erreurs import ErreurComptable
-from .modeles import (Compte, Ecriture, Exercice, Journal, Lettrage,
-                      LigneEcriture, LigneLettrage, Parametre, Taxe)
+from .modeles import (Compte, Cours, Ecriture, Exercice, Immobilisation,
+                      Journal, Lettrage, LigneEcriture, LigneLettrage, Parametre,
+                      Section, Taxe)
 
 TABLES_SYNC: dict[str, type] = {
     "compta_exercices": Exercice,
@@ -27,6 +28,9 @@ TABLES_SYNC: dict[str, type] = {
     "compta_journaux": Journal,
     "compta_taxes": Taxe,
     "compta_parametres": Parametre,
+    "compta_cours": Cours,
+    "compta_immobilisations": Immobilisation,
+    "compta_sections": Section,
     "compta_ecritures": Ecriture,
     "compta_lignes": LigneEcriture,
     "compta_lettrages": Lettrage,

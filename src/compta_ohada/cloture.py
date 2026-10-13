@@ -19,8 +19,9 @@ Une clôture est définitive : aucune écriture ne peut plus être datée dans N
 from __future__ import annotations
 
 from datetime import date, timedelta
+from decimal import Decimal
 
-from sqlalchemy import func, select
+from sqlalchemy import BigInteger, case, func, or_, select, type_coerce
 from sqlalchemy.orm import Session
 
 from .erreurs import ErreurComptable, EcritureInvalide, ExerciceClos
@@ -66,6 +67,17 @@ class ClotureMixin:
                     + "; ".join(f"{a['numero']} ({a['anomalie']})"
                                 for a in integrite["anomalies"][:5]))
 
+            # 1 bis. Créances, dettes et trésoreries en devise : conversion au
+            # cours de clôture (écarts de conversion, provision pour perte de
+            # change). Sans effet s'il n'y a aucune ligne en devise ouverte.
+            if (self._a_reevaluer(s, ex, ex.date_fin)
+                    and self._ecriture_source(
+                        s, "reevaluation", ex.date_fin.isoformat()) is None
+                    and self._ecriture_source(
+                        s, "reevaluation_tresorerie",
+                        ex.date_fin.isoformat()) is None):
+                self.reevaluer_devises(ex.date_fin, pendant_cloture=True, session=s)
+
             # 2. Détermination du résultat.
             mouvements = self._agreger(s, ex, exclure_types=(Ecriture.A_NOUVEAU,))
             lignes = []
@@ -110,6 +122,27 @@ class ClotureMixin:
                 raise ExerciceClos(
                     f"L'exercice {suivant.code} a déjà ses à-nouveaux.")
             ecriture_an = self._passer_a_nouveaux(s, ex, suivant)
+            # Les écarts de conversion sont latents : on les extourne à
+            # l'ouverture, les créances et dettes retrouvent leur cours
+            # historique (le règlement constatera l'écart réalisé).
+            ecarts = self._ecriture_source(s, "reevaluation", ex.date_fin.isoformat())
+            extourne = None
+            if ecarts is not None:
+                extourne = self.contrepasser(
+                    ecarts.id, date_ecriture=suivant.date_debut,
+                    motif="extourne des écarts de conversion", session=s)
+
+            # Contrôle non bloquant : biens dont les dotations de l'exercice
+            # n'ont pas été passées (oubli fréquent avant la clôture).
+            from .immobilisations import cumul_theorique
+            from .modeles import Immobilisation
+            oublis = [
+                immo.code for immo in s.scalars(select(Immobilisation).where(
+                    Immobilisation.tenant_id == self.tenant_id,
+                    Immobilisation.statut == Immobilisation.EN_SERVICE))
+                if immo.duree_mois and immo.date_mise_en_service <= ex.date_fin
+                and cumul_theorique(immo, ex.date_fin)
+                > self._cumul_comptabilise(s, immo, ex.date_fin)]
 
             # 4. Statut et verrouillage.
             ex.statut = Exercice.CLOTURE
@@ -122,33 +155,50 @@ class ClotureMixin:
             s.flush()
             return {"exercice": ex.code, "resultat": resultat,
                     "ecriture_resultat": ecriture_resultat,
-                    "exercice_suivant": suivant.code, "a_nouveaux": ecriture_an}
+                    "exercice_suivant": suivant.code, "a_nouveaux": ecriture_an,
+                    "extourne_ecarts_conversion": extourne,
+                    "immobilisations_non_dotees": oublis}
 
         return self._executer_avec_reprise_numerotation(_t, session)
 
     def _passer_a_nouveaux(self, s: Session, ex: Exercice, suivant: Exercice
                            ) -> dict | None:
-        lettrables = set(s.scalars(select(Compte.numero).where(
-            Compte.tenant_id == self.tenant_id, Compte.lettrable.is_(True))))
+        """À-nouveaux de ``suivant`` : un solde par compte de bilan, détaillé
+        par tiers ET par devise pour les comptes lettrables, avec le montant
+        en devise pour les comptes tenus en devise."""
+        detailles = set(s.scalars(select(Compte.numero).where(
+            Compte.tenant_id == self.tenant_id,
+            or_(Compte.lettrable.is_(True), Compte.devise.is_not(None)))))
         # Soldes de bilan par compte (ouverture + exercice, clôture incluse).
         soldes = self._soldes_a_date(s, ex, ex.date_fin)
-        # Détail par tiers pour les comptes lettrables : ouverture (AN de N)
-        # + mouvements de N, ventilés par tiers.
-        par_tiers: dict[tuple[str, str | None], list] = {}
+        # Détail (compte, tiers, devise) : ouverture (AN de N) + mouvements de N.
+        # type_coerce -> BigInteger : on manipule les centimes BRUTS, sans
+        # dépendre de la façon dont le dialecte type un CASE sur un Montant.
+        brut = type_coerce(LigneEcriture.montant_devise, BigInteger)
+        signe_devise = case((type_coerce(LigneEcriture.debit, BigInteger) > 0, brut),
+                            else_=-brut)
         req = (select(LigneEcriture.compte_numero, LigneEcriture.tiers_ref,
+                      LigneEcriture.devise,
                       func.max(LigneEcriture.tiers_nom),
                       func.coalesce(func.sum(LigneEcriture.debit), 0),
-                      func.coalesce(func.sum(LigneEcriture.credit), 0))
+                      func.coalesce(func.sum(LigneEcriture.credit), 0),
+                      func.coalesce(func.sum(signe_devise), 0))
                .join(Ecriture, Ecriture.id == LigneEcriture.ecriture_id)
                .where(LigneEcriture.tenant_id == self.tenant_id,
                       LigneEcriture.deleted_at.is_(None),
                       Ecriture.statut == Ecriture.VALIDEE,
                       Ecriture.exercice_id == ex.id,
-                      LigneEcriture.compte_numero.in_(lettrables))
-               .group_by(LigneEcriture.compte_numero, LigneEcriture.tiers_ref))
+                      LigneEcriture.compte_numero.in_(detailles))
+               .group_by(LigneEcriture.compte_numero, LigneEcriture.tiers_ref,
+                         LigneEcriture.devise))
         from .etats import _dec
-        for numero, ref, nom, d, c in s.execute(req):
-            par_tiers[(numero, ref)] = [nom, _dec(d) - _dec(c)]
+        detail_par_compte: dict[str, list] = {}
+        for numero, ref, devise, nom, d, c, dev in s.execute(req):
+            v = _dec(d) - _dec(c)
+            m_dev = (Decimal(int(dev)) / 100).quantize(Decimal("0.01")) if devise else None
+            if v or (m_dev or ZERO):
+                detail_par_compte.setdefault(numero, []).append(
+                    (ref, nom, devise, v, m_dev))
         # Échéance la plus ancienne encore ouverte, par tiers : la balance
         # âgée de N+1 garde la vraie ancienneté de la créance.
         lettrees = select(LigneLettrage.ligne_id).where(
@@ -163,30 +213,40 @@ class ClotureMixin:
                    LigneEcriture.deleted_at.is_(None),
                    Ecriture.statut == Ecriture.VALIDEE,
                    Ecriture.exercice_id == ex.id,
-                   LigneEcriture.compte_numero.in_(lettrables),
+                   LigneEcriture.compte_numero.in_(detailles),
                    LigneEcriture.debit > 0,
                    LigneEcriture.id.not_in(lettrees))
             .group_by(LigneEcriture.compte_numero, LigneEcriture.tiers_ref))}
         a_nouveaux_ex = self._a_des_a_nouveaux(s, ex)
         lignes = []
-        for numero in sorted(soldes):
-            solde = soldes[numero]
-            if numero.startswith(CLASSES_GESTION) or not solde:
+        for numero in sorted(set(soldes) | set(detail_par_compte)):
+            solde = soldes.get(numero, ZERO)
+            if numero.startswith(CLASSES_GESTION):
                 continue
-            detail = [(ref, nom, v) for (n, ref), (nom, v) in par_tiers.items()
-                      if n == numero and v]
-            total_detail = sum((v for _, _, v in detail), ZERO)
-            # Sans à-nouveaux en N (premier exercice, ou ouverture virtuelle),
-            # le solde d'ouverture n'a pas de détail par tiers : le reliquat
-            # éventuel est reporté sans tiers.
-            if numero in lettrables and detail:
-                for ref, nom, v in sorted(detail, key=lambda x: (x[0] or "")):
+            detail = detail_par_compte.get(numero, [])
+            if numero in detailles and detail:
+                total_detail = ZERO
+                for ref, nom, devise, v, m_dev in sorted(
+                        detail, key=lambda x: (x[0] or "", x[2] or "")):
+                    if not v:
+                        # Solde nul en monnaie de tenue mais pas en devise :
+                        # impossible à reporter sans montant, on le signale.
+                        if m_dev:
+                            raise ErreurComptable(
+                                f"Compte {numero} ({ref or 'sans tiers'}) : solde en "
+                                f"{devise} sans contre-valeur. Réévaluez les devises "
+                                "avant la clôture.")
+                        continue
                     ech = echeances.get((numero, ref)) if v > 0 else None
                     if isinstance(ech, str):
                         ech = date.fromisoformat(ech[:10])
+                    devise_kw = ({"devise": devise, "montant_devise": abs(m_dev)}
+                                 if devise else {})
                     lignes.append(Ligne(compte=numero, tiers_ref=ref, tiers_nom=nom,
                                         libelle="À-nouveau", date_echeance=ech,
+                                        **devise_kw,
                                         **({"debit": v} if v > 0 else {"credit": -v})))
+                    total_detail += v
                 reliquat = solde - total_detail
                 if reliquat and not a_nouveaux_ex:
                     lignes.append(Ligne(compte=numero, libelle="À-nouveau",
@@ -195,6 +255,8 @@ class ClotureMixin:
                 elif reliquat:
                     raise ErreurComptable(
                         f"Écart de ventilation par tiers sur {numero} ({reliquat}).")
+                continue
+            if not solde:
                 continue
             lignes.append(Ligne(compte=numero, libelle="À-nouveau",
                                 **({"debit": solde} if solde > 0

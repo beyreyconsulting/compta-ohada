@@ -27,6 +27,20 @@ def _centimes(valeur) -> str:
     return str(int((Decimal(str(valeur)) * 100).to_integral_value()))
 
 
+def _ligne(lg) -> list:
+    contenu = [lg.ordre, lg.compte_numero, _centimes(lg.debit),
+               _centimes(lg.credit), lg.tiers_ref or "", lg.libelle,
+               lg.taxe_code or "", _centimes(lg.base_taxe),
+               lg.date_echeance.isoformat() if lg.date_echeance else ""]
+    # Champs ajoutés en 0.2.0 (devise, section) : n'apparaissent que s'ils sont
+    # renseignés, pour que les empreintes des écritures 0.1.0 restent valides.
+    if getattr(lg, "devise", None):
+        contenu += [lg.devise, _centimes(lg.montant_devise)]
+    if getattr(lg, "section", None):
+        contenu += ["section", lg.section]
+    return contenu
+
+
 def contenu_canonique(ecriture, lignes, exercice_code: str,
                       empreinte_precedente: str) -> str:
     """Représentation déterministe (indépendante de la base et du poste)."""
@@ -44,13 +58,7 @@ def contenu_canonique(ecriture, lignes, exercice_code: str,
         "source": [ecriture.source_type or "", ecriture.source_id or ""],
         "contrepasse": ecriture.contrepasse_id or "",
         "document_lie": ecriture.document_lie or "",
-        "lignes": [
-            [lg.ordre, lg.compte_numero, _centimes(lg.debit),
-             _centimes(lg.credit), lg.tiers_ref or "", lg.libelle,
-             lg.taxe_code or "", _centimes(lg.base_taxe),
-             lg.date_echeance.isoformat() if lg.date_echeance else ""]
-            for lg in sorted(lignes, key=lambda x: (x.ordre, x.id))
-        ],
+        "lignes": [_ligne(lg) for lg in sorted(lignes, key=lambda x: (x.ordre, x.id))],
         "precedente": empreinte_precedente,
     }
     return json.dumps(donnees, ensure_ascii=False, sort_keys=True,

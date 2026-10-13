@@ -16,7 +16,11 @@ compta-ohada — cœur comptable SYSCOHADA révisé pour les ERP Beyrey Consulti
 
 from __future__ import annotations
 
+from .analytique import AnalytiqueMixin
 from .cloture import ClotureMixin
+from .devises import DevisesMixin
+from .immobilisations import ImmobilisationsMixin
+from .smt import SmtMixin, eligible_smt
 from .erreurs import (CompteInconnu, CompteNonImputable, DejaContrepassee,
                       EcritureDesequilibree, EcritureInvalide,
                       EcritureVerrouillee, ErreurComptable, ExerciceClos,
@@ -25,19 +29,21 @@ from .erreurs import (CompteInconnu, CompteNonImputable, DejaContrepassee,
                       TaxeInconnue)
 from .etats import EtatsMixin
 from .etats_financiers import EtatsFinanciersMixin
+from .exports import ExportsMixin
 from .evenements import (Achat, BulletinPaie, ChargePatronale, EvenementsMixin,
                          LigneMontant, Reglement, Retenue, Vente)
-from .modeles import (Compte, Ecriture, Exercice, Journal, Lettrage,
+from .modeles import (Compte, Cours, Ecriture, Immobilisation, Section, Exercice, Journal, Lettrage,
                       LigneEcriture, LigneLettrage, Parametre, Taxe)
 from .noyau import Ligne, Noyau
 from .socle import Base, Montant, SyncMixin, metadata
 from .synchro import TABLES_SYNC, valider_ligne_entrante
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 
-class Comptabilite(EvenementsMixin, EtatsMixin, EtatsFinanciersMixin,
-                   ClotureMixin, Noyau):
+class Comptabilite(EvenementsMixin, DevisesMixin, ImmobilisationsMixin,
+                   AnalytiqueMixin, EtatsMixin, EtatsFinanciersMixin, SmtMixin,
+                   ExportsMixin, ClotureMixin, Noyau):
     """Point d'entrée : la comptabilité d'UN tenant vue depuis UN poste.
 
     ``tenant_id`` : identifiant de la boutique / de l'école dans l'ERP.
@@ -54,6 +60,7 @@ def creer_schema(engine) -> None:
 
 __all__ = [
     "Comptabilite", "creer_schema", "metadata", "Base", "Montant", "SyncMixin",
+    "Cours", "Immobilisation", "Section", "eligible_smt",
     "Ligne", "Vente", "Achat", "LigneMontant", "Reglement", "BulletinPaie",
     "Retenue", "ChargePatronale",
     "Compte", "Ecriture", "Exercice", "Journal", "Lettrage", "LigneEcriture",
