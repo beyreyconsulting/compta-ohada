@@ -194,14 +194,14 @@ class EvenementsMixin:
                 continue
             compte = lg.compte or self._parametre(s, compte_defaut_param)
             brutes.append((str(compte), self._code_taxe(s, lg.taxe, type_taxe), m))
-            sections.append(lg.section or None)
+            sections.append(str(lg.section).strip().upper() if lg.section else None)
         if not brutes:
             raise EcritureInvalide("Document de montant nul.")
         taxes = self._taxes_tenant(s, type_taxe)
         ventilees, taxes_v = ventiler(brutes, taxes, prix_ttc=prix_ttc)
         # Agrégation par (compte, taxe) : une ligne d'écriture par couple.
         par_compte: dict[tuple[str, str | None, str | None], Decimal] = {}
-        for v, section in zip(ventilees, sections):
+        for v, section in zip(ventilees, sections, strict=True):
             cle = (v.compte, v.taxe_code, section)
             par_compte[cle] = par_compte.get(cle, ZERO) + v.ht
         total_ttc = sum((v.ttc for v in ventilees), ZERO)

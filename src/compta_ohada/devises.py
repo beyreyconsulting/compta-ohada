@@ -32,17 +32,12 @@ from decimal import ROUND_HALF_UP, Decimal
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from .erreurs import EcritureInvalide, ParametreInvalide
+from .erreurs import ParametreInvalide
 from .modeles import (Compte, Cours, Ecriture, LigneEcriture, LigneLettrage,
                       id_deterministe)
-from .noyau import (PARAMETRES_PAR_DEFAUT, Ligne, _date, resume_ecriture,
+from .noyau import (Ligne, _date, resume_ecriture,
                     valider_code_devise)
 from .socle import CENTIME, INCLURE_SUPPRIMES, ZERO, montant
-
-PARAMETRES_DEVISES = {cle: v for cle, v in PARAMETRES_PAR_DEFAUT.items()
-                      if "change" in cle or "conversion" in cle
-                      or "provision_financiere" in cle}
-
 
 def convertir(montant_devise: Decimal, cours: Decimal) -> Decimal:
     return (montant_devise * cours).quantize(CENTIME, rounding=ROUND_HALF_UP)
@@ -89,6 +84,30 @@ class DevisesMixin:
             raise ParametreInvalide(
                 f"Aucun cours {devise} connu au {jour:%d/%m/%Y} : "
                 "saisissez-le avec definir_cours().")
+        return c.cours
+
+    # Un cours de clôture plus ancien que ce délai est refusé : réévaluer au
+    # 31/12 avec un cours de janvier fausserait le bilan sans alerte.
+    AGE_MAX_COURS_CLOTURE = 31
+
+    def _cours_cloture(self, s: Session, devise: str, jour: date,
+                       utilises: dict, strict: bool) -> Decimal:
+        c = s.scalar(select(Cours).where(
+            Cours.tenant_id == self.tenant_id, Cours.devise == devise,
+            Cours.date_cours <= jour).order_by(Cours.date_cours.desc()).limit(1))
+        if c is None:
+            raise ParametreInvalide(
+                f"Aucun cours {devise} connu au {jour:%d/%m/%Y} : "
+                "saisissez-le avec definir_cours().")
+        parite_fixe = devise == "EUR" and (self._parametre(s, "devise") or "XOF") in (
+            "XOF", "XAF")
+        if (strict and not parite_fixe
+                and (jour - c.date_cours).days > self.AGE_MAX_COURS_CLOTURE):
+            raise ParametreInvalide(
+                f"Le dernier cours {devise} date du {c.date_cours:%d/%m/%Y} : trop "
+                f"ancien pour la clôture du {jour:%d/%m/%Y}. Saisissez le cours de "
+                f"clôture avec definir_cours(\"{devise}\", \"{jour.isoformat()}\", …).")
+        utilises[devise] = {"date": c.date_cours, "cours": c.cours}
         return c.cours
 
     def cours_du(self, devise: str, jour, *, session: Session | None = None) -> Decimal:
@@ -235,7 +254,9 @@ class DevisesMixin:
             if resultat:
                 return {"ecarts": resultat.get("reevaluation"),
                         "tresorerie": resultat.get("reevaluation_tresorerie"),
-                        "provision": resultat.get("provision_change")}
+                        "provision": resultat.get("provision_change"),
+                        "cours_utilises": None}
+            cours_utilises: dict = {}
 
             lettrables = set(s.scalars(select(Compte.numero).where(
                 Compte.tenant_id == self.tenant_id, Compte.lettrable.is_(True))))
@@ -278,7 +299,8 @@ class DevisesMixin:
                     tiers.items(), key=lambda kv: (kv[0][0], kv[0][1] or "", kv[0][2])):
                 if d == ZERO and x == ZERO:
                     continue
-                ecart = convertir(d, self._cours(s, devise, jour)) - x
+                ecart = convertir(d, self._cours_cloture(
+                    s, devise, jour, cours_utilises, pendant_cloture)) - x
                 if ecart == ZERO:
                     continue
                 lib = f"Écart de conversion {devise} au {jour:%d/%m/%Y}"
@@ -306,7 +328,8 @@ class DevisesMixin:
 
             lignes_tresor: list[Ligne] = []
             for (compte, devise), (x, d) in sorted(tresor.items()):
-                ecart = convertir(d, self._cours(s, devise, jour)) - x
+                ecart = convertir(d, self._cours_cloture(
+                    s, devise, jour, cours_utilises, pendant_cloture)) - x
                 if ecart == ZERO:
                     continue
                 lib = f"Conversion {devise} au cours de clôture"
@@ -353,7 +376,8 @@ class DevisesMixin:
                     ignorer_verrou=pendant_cloture, session=s)
             return {"ecarts": resultat.get("ecarts"),
                     "tresorerie": resultat.get("tresorerie"),
-                    "provision": resultat.get("provision")}
+                    "provision": resultat.get("provision"),
+                    "cours_utilises": cours_utilises}
 
         return self._executer_avec_reprise_numerotation(_t, session)
 

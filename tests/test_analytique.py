@@ -68,3 +68,11 @@ def test_section_conservee_par_la_contrepassation(ca):
     ca.contrepasser(v["facture"]["id"], date_ecriture="2026-02-02")
     r = ca.resultat_analytique("2026-01-01", "2026-12-31")
     assert {x["section"]: x["resultat"] for x in r["sections"]}["QUINC"] == D(0)
+
+
+def test_casse_de_section_normalisee(ca):
+    """Régression : « peint » et « PEINT » produisaient deux lignes."""
+    r = ca.comptabiliser_vente(Vente("V", J(2026, 2, 1), [
+        LigneMontant("1180", section="peint"), LigneMontant("1180", section="PEINT")]))
+    produits = [l for l in r["facture"]["lignes"] if l["compte"] == "7011"]
+    assert [(l["section"], l["credit"]) for l in produits] == [("PEINT", D(2000))]

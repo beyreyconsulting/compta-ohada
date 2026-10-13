@@ -81,7 +81,7 @@ def ventiler(lignes: list[tuple[str, str | None, Decimal]],
                 "Montant net négatif pour un taux de TVA : les remises "
                 "dépassent les ventes. Saisissez un avoir à la place.")
         if code is None or code not in taxes:
-            for i, m in zip(indices, montants):
+            for i, m in zip(indices, montants, strict=True):
                 ht[i] = ttc[i] = m
             continue
         taux, compte_tva = taxes[code]
@@ -93,7 +93,7 @@ def ventiler(lignes: list[tuple[str, str | None, Decimal]],
             total_ht = total
             total_tva = (total * t).quantize(CENTIME, rounding=ROUND_HALF_UP)
         parts = _repartir(total_tva, montants)
-        for i, m, part in zip(indices, montants, parts):
+        for i, m, part in zip(indices, montants, parts, strict=True):
             if prix_ttc:
                 ht[i], ttc[i] = m - part, m
             else:

@@ -226,3 +226,32 @@ def test_reglement_dans_une_autre_devise_que_la_facture_refuse(cd):
         cd.comptabiliser_reglement_client("R2", "2026-04-02", "10",
                                           vente_source_id="VX", tiers_ref="C-X",
                                           devise="USD")
+
+
+def test_cloture_refuse_un_cours_perime(compta):
+    """Régression : la clôture réévaluait en silence au dernier cours connu,
+    même vieux de onze mois."""
+    from compta_ohada import ParametreInvalide
+    compta.definir_cours("USD", "2026-01-15", "600")
+    compta.comptabiliser_vente(Vente("V", J(2026, 2, 1), [LigneMontant("100", taxe="")],
+                                     tiers_ref="C", devise="USD"))
+    with pytest.raises(ParametreInvalide, match="trop ancien"):
+        compta.cloturer_exercice("2026")
+    assert compta.ecritures(journal="OD") == []           # rien n'a été écrit
+    compta.definir_cours("USD", "2026-12-31", "590")
+    cl = compta.cloturer_exercice("2026")
+    assert cl["extourne_ecarts_conversion"] is not None
+
+
+def test_reevaluation_indique_les_cours_utilises(cd):
+    cd.comptabiliser_vente(Vente("V", J(2026, 3, 2), [LigneMontant("10", taxe="")],
+                                 tiers_ref="C", devise="USD"))
+    r = cd.reevaluer_devises("2026-12-31")
+    assert r["cours_utilises"] == {"USD": {"date": J(2026, 12, 31), "cours": D(580)}}
+
+
+def test_parite_euro_jamais_perimee(compta):
+    compta.comptabiliser_vente(Vente("V", J(2026, 2, 1), [LigneMontant("100", taxe="")],
+                                     tiers_ref="C", devise="EUR"))
+    cl = compta.cloturer_exercice("2026")
+    assert cl["extourne_ecarts_conversion"] is None        # parité fixe : aucun écart

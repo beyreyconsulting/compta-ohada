@@ -441,7 +441,7 @@ class EtatsFinanciersMixin:
                 v1 = self._bilan_valeurs(s, precedent, precedent.date_fin)
                 actif_n1 = self._assembler(STRUCTURE_ACTIF, v1["postes"], actif=True)
                 passif_n1 = self._assembler(STRUCTURE_PASSIF, v1["postes"], actif=False)
-            def _lignes(struct, valeurs, n1, est_actif):
+            def _lignes(struct, valeurs, n1):
                 sortie = []
                 enfants_de = dict(struct)
                 for code in _ordre_affichage(struct):
@@ -452,8 +452,8 @@ class EtatsFinanciersMixin:
                 return sortie
             return {
                 "exercice": ex.code, "date_arrete": jour,
-                "actif": _lignes(STRUCTURE_ACTIF, actif, actif_n1, True),
-                "passif": _lignes(STRUCTURE_PASSIF, passif, passif_n1, False),
+                "actif": _lignes(STRUCTURE_ACTIF, actif, actif_n1),
+                "passif": _lignes(STRUCTURE_PASSIF, passif, passif_n1),
                 "total_actif": actif["BZ"]["net"],
                 "total_passif": passif["DZ"]["net"],
                 "equilibre": actif["BZ"]["net"] == passif["DZ"]["net"],

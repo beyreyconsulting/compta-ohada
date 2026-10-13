@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import time
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Callable, Iterable
@@ -1211,7 +1211,7 @@ class Noyau:
             self._valider(s, inverse, crees)
             # Lettrage original <-> inverse sur les comptes lettrables.
             meme_exercice = ex.id == e.exercice_id
-            for orig, inv in zip(originales, crees):
+            for orig, inv in zip(originales, crees, strict=True):
                 compte = self._compte_par_numero(s, orig.compte_numero)
                 if compte is None or not compte.lettrable:
                     continue
@@ -1402,7 +1402,7 @@ class Noyau:
                 chaines.setdefault(
                     (e.journal_code, e.exercice_id, e.poste), []).append(e)
             anomalies = []
-            for (journal, exercice_id, poste), liste in chaines.items():
+            for (_, exercice_id, _), liste in chaines.items():
                 liste.sort(key=lambda x: x.sequence or 0)
                 precedente = GENESE
                 attendu = 1

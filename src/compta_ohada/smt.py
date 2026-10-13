@@ -29,7 +29,7 @@ from sqlalchemy.orm import Session
 from .erreurs import ParametreInvalide
 from .etats import CLASSES_BILAN, CLASSES_GESTION
 from .etats_financiers import _plus_long_prefixe
-from .modeles import Compte, Ecriture, LigneEcriture
+from .modeles import Compte, Ecriture
 from .noyau import _date
 from .socle import ZERO
 

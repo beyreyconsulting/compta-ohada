@@ -132,7 +132,7 @@ def doc_balance_agee(lignes: list[dict], prefixe: str, jour) -> Document:
     totaux = [ZERO] * (len(tranches) + 1)
     for l in lignes:
         valeurs = [l[t] for t in tranches] + [l["solde"]]
-        totaux = [a + v for a, v in zip(totaux, valeurs)]
+        totaux = [a + v for a, v in zip(totaux, valeurs, strict=True)]
         b.ajouter([l["compte"], l["tiers_ref"] or "", l["tiers_nom"] or ""] + valeurs)
     b.ajouter(["", "", "TOTAL"] + totaux, "total")
     return Document(f"Balance âgée — comptes {prefixe}", f"Au {_d(jour)}", [b],
@@ -311,7 +311,7 @@ def rendre_xlsx(doc: Document, chemin: Path, entete: list[str], decimales: int) 
             premier_tableau = rang
         rang += 1
         for valeurs, style in bloc.lignes:
-            for j, ((_, type_), v) in enumerate(zip(bloc.colonnes, valeurs), 1):
+            for j, ((_, type_), v) in enumerate(zip(bloc.colonnes, valeurs, strict=True), 1):
                 if v is None or v == "":
                     cell = ws.cell(rang, j)
                 elif type_ == MONTANT:
@@ -405,7 +405,7 @@ def rendre_pdf(doc: Document, chemin: Path, entete: list[str], decimales: int) -
         ]
         for r, (valeurs, st) in enumerate(bloc.lignes, 1):
             ligne = []
-            for (n, t), v in zip(bloc.colonnes, valeurs):
+            for (_, t), v in zip(bloc.colonnes, valeurs, strict=True):
                 if t == MONTANT:
                     texte = _format_montant(v, decimales) if v is not None else ""
                 elif t == POURCENT:
